@@ -1,0 +1,136 @@
+name: ai-feature-review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-feature-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Free, instant, identical on every run. continue-on-error so the review
+      # still runs against the same file — deferred to the gate step below,
+      # not forgiven.
+      - name: Syntax check site/scripts.js
+        id: syntax
+        continue-on-error: true
+        run: |
+          if [ -f site/scripts.js ]; then
+            node --check site/scripts.js
+          else
+            echo "site/scripts.js not present on this branch — nothing to check."
+          fi
+
+      # review_cli.py's own exit code already encodes the gate (1 = blocking
+      # findings, 2 = reviewer failure). continue-on-error so the comment and
+      # gate steps below still run and can report why.
+      - name: Run AI feature review
+        id: review
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python review_cli.py --feature landing_page --mode ci --out review-output.json
+
+      - name: Upload review output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-output
+          path: review-output.json
+          if-no-files-found: ignore
+
+      - name: Post findings as a PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+
+            let report = null;
+            try {
+              report = JSON.parse(fs.readFileSync("review-output.json", "utf8"));
+            } catch {
+              report = { ok: false, error: "review-output.json was not produced.", findings: [], blocking: [] };
+            }
+
+            const sevOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+            const findings = [...(report.findings || [])].sort(
+              (a, b) => (sevOrder[a.severity] ?? 9) - (sevOrder[b.severity] ?? 9)
+            );
+            const blockingKeys = new Set(
+              (report.blocking || []).map((f) => `${f.file}:${f.line}:${f.summary}`)
+            );
+
+            let body = "### AI Feature Review\n\n";
+
+            if (!report.ok) {
+              body += `**REVIEW FAILED:** ${report.error}\n\nThis is a reviewer failure, not a verdict on the code.\n`;
+            } else if (findings.length === 0) {
+              body += "No findings above the reporting threshold.\n";
+            } else {
+              body += "| Severity | File:Line | Category | Summary |\n|---|---|---|---|\n";
+              for (const f of findings) {
+                const key = `${f.file}:${f.line}:${f.summary}`;
+                const gate = blockingKeys.has(key) ? " 🚫 **blocks merge**" : "";
+                body += `| ${String(f.severity).toUpperCase()} | ${f.file}:${f.line} | ${f.category} | ${f.summary}${gate} |\n`;
+              }
+            }
+
+            if (report.denied_calls && report.denied_calls.length) {
+              body += "\n**Denied tool calls:**\n";
+              for (const d of report.denied_calls) {
+                body += `- \`${d.tool}(${d.input})\` — ${d.reason}\n`;
+              }
+            }
+
+            body += "\n---\n";
+            body += `tools used: ${(report.tools_used || []).join(", ") || "none"} | `;
+            body += `${report.turns ?? "?"} turns | $${(report.cost_usd ?? 0).toFixed(4)} | exit code ${report.exit_code ?? "?"}\n`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # Both gates enforced here, together: a syntax error node can prove, and
+      # the reviewer's own verdict (blocking findings, or exit 2 on reviewer
+      # failure). Either one fails the job, which is what a required status
+      # check on `main` blocks the merge on.
+      - name: Enforce the merge gate
+        if: always()
+        run: |
+          failed=0
+          if [ "${{ steps.syntax.outcome }}" = "failure" ]; then
+            echo "site/scripts.js failed node --check (syntax error)."
+            failed=1
+          fi
+          if [ "${{ steps.review.outcome }}" = "failure" ]; then
+            echo "AI review reported blocking findings, or the reviewer itself failed."
+            failed=1
+          fi
+          exit $failed
